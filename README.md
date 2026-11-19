@@ -7,7 +7,7 @@ A Python service that checks for Tesla Supercharger and Premium Connectivity inv
 1. Create an application using **Docker Compose** from this repository. Select branch `main` and Compose file `/compose.yaml`. This is a background worker. It needs a single replica, the persistent `invoices` volume mounted at `/data`, and no public domain, port, or Coolify scheduled task. Keep the same volume on redeploy and include it in backups.
 2. Configure the variables from [`.env.example`](.env.example) in Coolify as runtime settings. Set `MAIL_TO` to Heinrich's email address. Set the Tesla sources, SMTP settings, and S3 settings described below. Supply credentials through Coolify's environment settings and keep them out of the repository.
 3. Deploy and check that the logs say `Schedule active`. The worker starts the day's check at noon Berlin time, including daylight saving changes. If started later on an eligible day, it runs that day's outstanding check. Failed checks retry after 30 minutes during the active window. The next eligible check discovers invoices published during missed days and resumes locally queued deliveries.
-4. In the worker terminal, run `python -m tesla_invoice run --download-only` to verify portal and S3 access. Use `python -m tesla_invoice status` to inspect queued invoices. Then run `python -m tesla_invoice run` to verify actual SMTP delivery with the configured recipient. Run these commands while a scheduled check is idle. On a fresh deployment after noon, the scheduler can already have started a delivery run, so deploy before noon or on a weekend if you need to verify without sending first.
+4. Complete the one-time [Tesla Fleet authorization](#supercharger-authorization). In the worker terminal, run `python -m tesla_invoice run --download-only` to verify portal and S3 access. Use `python -m tesla_invoice status` to inspect queued invoices. Then run `python -m tesla_invoice run` to verify actual SMTP delivery with the configured recipient. Run these commands while a scheduled check is idle. On a fresh deployment after noon, the scheduler can already have started a delivery run, so deploy before noon or on a weekend if you need to verify without sending first.
 
 [Coolify Docker Compose documentation](https://coolify.io/docs/knowledge-base/docker/compose)
 
@@ -30,11 +30,10 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
 
 2. Enter your Tesla credentials, SMTP settings, and the shared-bucket settings in `.env`. Set `MAIL_FROM` and `MAIL_TO` to one email address each. Use `SMTP_SECURITY=starttls` for port 587 or `SMTP_SECURITY=ssl` for port 465, as required by your provider. Put passwords containing `$` or `#` in single quotes in the Compose environment file. Both the file and the Docker volume contain sensitive data.
 
-3. Configure the source for each category. Tesla lists Premium Connectivity invoices under **Manage Vehicle → Documents** in the web account. The German Supercharging support page directs users to the charging history in the Tesla app. Automatic web downloads require a PDF download for that category in your Tesla account. [Premium Connectivity support](https://www.tesla.com/support/connectivity) · [Supercharging support for Germany](https://www.tesla.com/de_de/support/charging/supercharging)
+3. Configure Supercharger retrieval using the [Tesla Fleet authorization](#supercharger-authorization) instructions below. For Premium Connectivity, configure the web source under **Manage Vehicle → Documents** in your signed-in account. [Premium Connectivity support](https://www.tesla.com/support/connectivity)
 
    | Setting | Value |
    | --- | --- |
-   | `SOURCE` | `portal` to download from the web account or `inbox` to import local PDFs |
    | `URL` | HTTPS URL on Tesla.com for the invoice list after signing in |
    | `LIST` | CSS selector for the visible list container |
    | `INVOICE` | CSS selector for PDF links or download buttons in this category |
@@ -43,9 +42,7 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
    | `MODE` | `download` for buttons that trigger a browser download or `href` for direct PDF links on Tesla.com |
    | `ID_ATTRIBUTE` | Optional attribute that holds a stable, unique invoice ID, such as `data-invoice-id` |
 
-   Settings use the `TESLA_CONNECTIVITY_` or `TESLA_SUPERCHARGER_` prefix. Sign in to your Tesla account and use your browser's developer tools to find the URL and selectors. Match only invoices for the requested category, since the Documents page can contain other records. Without a stable ID, the service downloads the visible PDFs again and deduplicates them by content. Use `ID_ATTRIBUTE` if Tesla assigns a new ID to each invoice revision or if you only need one version per ID.
-
-   If your Supercharger invoices are only available in the app, set `TESLA_SUPERCHARGER_SOURCE=inbox` and export PDFs to `/data/inbox/supercharger/` inside the worker. The equivalent directory for Premium Connectivity is `/data/inbox/connectivity/`. Make the files readable by the container. While the service is running, copy each file with a temporary extension and rename it to `.pdf` once copying finishes. The app export is manual. The scheduled import and email delivery are automatic.
+   Use the `TESLA_CONNECTIVITY_` prefix. If your account exposes a Supercharger PDF list in the browser, `TESLA_SUPERCHARGER_SOURCE=portal` uses the same settings with the `TESLA_SUPERCHARGER_` prefix. Sign in to your Tesla account and use your browser's developer tools to find the URL and selectors. Match only invoices for the requested category, since the Documents page can contain other records. Without a stable ID, the service downloads the visible PDFs again and deduplicates them by content. Use `ID_ATTRIBUTE` if Tesla assigns a new ID to each invoice revision or if you only need one version per ID.
 
 4. Verify the setup without sending email.
 
@@ -55,7 +52,7 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
    docker compose run --rm invoices status
    ```
 
-   The first run collects every PDF found in the configured lists and import directories, including older invoices. The first delivery run sends one email per collected invoice. If you only want invoices discovered after setup, run `docker compose run --rm invoices run --baseline` before starting the service. This saves existing PDFs without queuing them for delivery.
+   The first run collects every PDF found in the configured Tesla sources, including older invoices. The first delivery run sends one email per collected invoice. If you only want invoices discovered after setup, run `docker compose run --rm invoices run --baseline` before starting the service. This saves existing PDFs without queuing them for delivery.
 
 5. Start the service.
 
@@ -66,9 +63,19 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
 
    Set `RUN_DAYS` to a comma-separated list using `mon,tue,wed,thu,fri,sat,sun`. `RUN_TIME` is local to `RUN_TIMEZONE`. An outstanding check for the current scheduled day runs after startup if the scheduled time has passed. Run `docker compose run --rm invoices run` for an immediate check and delivery when no other check is active.
 
+## Supercharger authorization
+
+Supercharger invoices are retrieved through Tesla's official Fleet API by default. The service reads charging history, walks the available pages, and downloads each new PDF by invoice ID. It reuses the existing S3 archive and email delivery queue. Fleet API requests may incur usage charges. [Charging endpoints](https://developer.tesla.com/docs/fleet-api/endpoints/charging-endpoints) · [Tesla billing](https://developer.tesla.com/docs/fleet-api/billing-and-limits)
+
+1. Register a Tesla Fleet API application for Europe and complete Tesla's partner registration for that region. Register a trusted HTTPS callback URL you control. Set `TESLA_FLEET_CLIENT_ID`, `TESLA_FLEET_CLIENT_SECRET`, and `TESLA_FLEET_REDIRECT_URI` in Coolify or your local `.env`. Keep the callback free of third-party analytics or query-string logging. [Fleet API setup](https://developer.tesla.com/docs/fleet-api/)
+2. Run `python -m tesla_invoice fleet-authorize` in the interactive Coolify worker terminal, or `docker compose run --rm invoices fleet-authorize` locally. Open the printed Tesla sign-in link, sign in, and grant Tesla's charging-management scope. After Tesla redirects you, paste the full callback URL into the hidden terminal prompt. The command checks the OAuth state and stores the rotating refresh token in the persistent worker volume. [Tesla OAuth flow](https://developer.tesla.com/docs/fleet-api/authentication/third-party-tokens)
+3. Run a download-only check and compare the Supercharger result with your Tesla account. Renew authorization if Tesla revokes or expires the grant. Subsequent invoice checks refresh access automatically and require no invoice exports.
+
+Premium Connectivity uses the Tesla web account session independently of Fleet authorization.
+
 ## Sign-in with MFA
 
-The service reuses the saved session and tries the configured credentials when sign-in is required. If Tesla prompts for MFA, a CAPTCHA, or another interactive check, sign in with the browser opened by the following commands on a Linux desktop with Python installed. Return to the signed-in account page before saving the session. When the session expires, repeat the import if interactive verification is still required.
+The Premium Connectivity web source reuses the saved browser session and tries the configured credentials when sign-in is required. If Tesla prompts for MFA, a CAPTCHA, or another interactive check, sign in with the browser opened by the following commands on a Linux desktop with Python installed. Return to the signed-in account page before saving the session. When the session expires, repeat the import if interactive verification is still required.
 
 ```sh
 python -m venv .venv

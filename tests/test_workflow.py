@@ -19,8 +19,6 @@ ENV = {
     "SMTP_HOST": "smtp.example.com",
     "MAIL_FROM": "sender@example.com",
     "MAIL_TO": "recipient@example.com",
-    "TESLA_SUPERCHARGER_SOURCE": "inbox",
-    "TESLA_CONNECTIVITY_SOURCE": "inbox",
 }
 
 
@@ -33,7 +31,14 @@ class WorkflowTest(unittest.TestCase):
         self.archive.bucket = "shared-bucket"
         self.archive.save.side_effect = lambda category, digest, pdf: f"tesla-invoices/{category}/{digest}.pdf"
         self.enterContext(patch("tesla_invoice.__main__.Archive", return_value=self.archive))
-        self.enterContext(patch.dict(os.environ, {**ENV, "INBOX_DIR": temp}, clear=True))
+        self.enterContext(patch.dict(os.environ, ENV, clear=True))
+        self.upstream = []
+        self.enterContext(patch("tesla_invoice.__main__.download_invoices", side_effect=self.download))
+
+    def download(self, db, root, run_id):
+        for category, pdf in self.upstream:
+            store_pdf(db, category, pdf, run_id=run_id)
+        return True
 
     def client(self):
         client = MagicMock()
@@ -48,14 +53,11 @@ class WorkflowTest(unittest.TestCase):
 
     def test_new_pdfs_only_are_sent(self):
         client = self.client()
-        for category in ("supercharger", "connectivity"):
-            (self.root / category).mkdir()
-        (self.root / "connectivity" / "a.pdf").write_bytes(PDF)
+        self.upstream.append(("connectivity", PDF))
         self.assertTrue(run_once(self.db, self.root, download_only=True))
         client.data.assert_not_called()
         self.assertTrue(run_once(self.db, self.root))
-        (self.root / "connectivity" / "duplicate.pdf").write_bytes(PDF)
-        (self.root / "supercharger" / "b.pdf").write_bytes(PDF + b" ")
+        self.upstream.extend([("connectivity", PDF), ("supercharger", PDF + b" ")])
         self.assertTrue(run_once(self.db, self.root))
         self.assertEqual(client.data.call_count, 2)
         message = BytesParser(policy=policy.default).parsebytes(client.data.call_args.args[0])
@@ -71,15 +73,6 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn(retrieved_at, message.get_body().get_content())
         self.assertEqual(self.archive.save.call_count, 2)
         self.assertEqual(self.statuses(), [("sent",), ("sent",)])
-
-    def test_invalid_pdf_does_not_block_valid_pdf(self):
-        client = self.client()
-        (self.root / "connectivity").mkdir()
-        (self.root / "connectivity" / "a.pdf").write_bytes(b"<html>Sign in</html>")
-        (self.root / "connectivity" / "b.pdf").write_bytes(PDF)
-        self.assertFalse(run_once(self.db, self.root))
-        client.data.assert_called_once()
-        self.assertEqual(self.statuses(), [("sent",)])
 
     def test_explicit_smtp_rejection_is_retried(self):
         client = self.client()

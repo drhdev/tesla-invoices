@@ -18,8 +18,9 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from .archive import Archive
+from .fleet import Fleet
 
-from .portal import LoginRequired, Source, collect, goto, is_login, safe_error, tesla_url, validate_pdf
+from .portal import LoginRequired, Source, collect, goto, is_login, safe_error, tesla_url
 
 LOG = logging.getLogger("tesla_invoice")
 CATEGORIES = {"supercharger": "Supercharger", "connectivity": "Premium Connectivity"}
@@ -123,20 +124,6 @@ def save_state(root, state):
     temporary.replace(target)
 
 
-def import_pdfs(db, category, folder, limit, run_id):
-    success = True
-    for path in sorted(folder.glob("*.pdf")):
-        try:
-            with path.open("rb") as file:
-                data = file.read(limit + 1)
-            validate_pdf(data, limit)
-            store_pdf(db, category, data, run_id=run_id)
-        except Exception as exc:
-            LOG.error("%s: PDF import failed (%s)", category, safe_error(exc))
-            success = False
-    return success
-
-
 def check_portal(db, root, sources, limit, run_id):
     from playwright.sync_api import sync_playwright
 
@@ -176,23 +163,45 @@ def download_invoices(db, root, run_id):
     limit = int(os.getenv("MAX_PDF_BYTES", "10000000"))
     if limit < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
-    sources = []
+    mode = os.getenv("TESLA_SUPERCHARGER_SOURCE", "fleet")
     success = True
-    for category in CATEGORIES:
-        folder = Path(os.getenv("INBOX_DIR") or root / "inbox") / category
-        if not import_pdfs(db, category, folder, limit, run_id):
-            success = False
+    sources = []
+    if mode == "fleet":
         try:
-            mode = os.getenv(f"TESLA_{category.upper()}_SOURCE", "portal")
-            if mode == "portal":
-                sources.append(Source.from_env(category))
-            elif mode != "inbox":
-                raise ValueError("Source must be portal or inbox")
+            fleet = Fleet(root)
+
+            def known(invoice_id):
+                return db.execute(
+                    "SELECT 1 FROM portal_ids WHERE category='supercharger' AND invoice_id=?",
+                    (invoice_id,),
+                ).fetchone() is not None
+
+            success = retry(
+                lambda: fleet.collect(
+                    limit, known, lambda pdf, invoice_id: store_pdf(db, "supercharger", pdf, invoice_id, run_id), retry
+                ),
+                "Tesla Fleet history",
+            )
+            if success:
+                LOG.info("Supercharger: Tesla Fleet API check complete")
+        except Exception as exc:
+            LOG.error("Supercharger: Tesla Fleet API check failed (%s)", safe_error(exc))
+            success = False
+    elif mode == "portal":
+        sources.append("supercharger")
+    else:
+        LOG.error("TESLA_SUPERCHARGER_SOURCE must be fleet or portal")
+        success = False
+    sources.append("connectivity")
+    configured = []
+    for category in sources:
+        try:
+            configured.append(Source.from_env(category))
         except (ValueError, KeyError) as exc:
             LOG.error("%s: %s", category, str(exc))
             success = False
-    if sources:
-        return check_portal(db, root, sources, limit, run_id) and success
+    if configured:
+        return check_portal(db, root, configured, limit, run_id) and success
     return success
 
 
@@ -389,14 +398,14 @@ def schedule():
     if int(os.getenv("MAX_PDF_BYTES", "10000000")) < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
     root = Path(os.getenv("DATA_DIR", "/data"))
-    for category in CATEGORIES:
-        mode = os.getenv(f"TESLA_{category.upper()}_SOURCE", "portal")
-        if mode == "portal":
-            Source.from_env(category)
-        elif mode == "inbox":
-            (Path(os.getenv("INBOX_DIR") or root / "inbox") / category).mkdir(parents=True, exist_ok=True)
-        else:
-            raise ValueError(f"{category}: source must be portal or inbox")
+    mode = os.getenv("TESLA_SUPERCHARGER_SOURCE", "fleet")
+    if mode == "fleet":
+        Fleet(root)
+    elif mode == "portal":
+        Source.from_env("supercharger")
+    else:
+        raise ValueError("TESLA_SUPERCHARGER_SOURCE must be fleet or portal")
+    Source.from_env("connectivity")
     LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri"), scheduled_time, zone)
     while True:
         delay = 15
@@ -445,7 +454,7 @@ def main():
     mode = run.add_mutually_exclusive_group()
     mode.add_argument("--download-only", action="store_true")
     mode.add_argument("--baseline", action="store_true")
-    for name in ("schedule", "status", "login", "import-session", "health"):
+    for name in ("schedule", "status", "login", "import-session", "health", "fleet-authorize"):
         commands.add_parser(name)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("digest")
@@ -459,6 +468,13 @@ def main():
             schedule()
             return 0
         with locked_data() as root:
+            if args.command == "fleet-authorize":
+                import sys
+
+                if not sys.stdin.isatty():
+                    parser.error("fleet-authorize requires an interactive terminal")
+                Fleet(root).authorize()
+                return 0
             if args.command == "login":
                 interactive_session(root)
                 return 0
