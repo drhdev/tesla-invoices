@@ -160,12 +160,10 @@ class WorkflowTest(unittest.TestCase):
                 tesla_url(url)
         self.assertEqual(tesla_url("https://auth.tesla.com"), "https://auth.tesla.com")
 
-    def test_country_url_sets_login_and_explicit_override_takes_precedence(self):
+    def test_login_url_defaults_to_germany_and_accepts_an_override(self):
         self.assertEqual(login_url_from_env(), "https://www.tesla.com/de_de/teslaaccount")
-        with patch.dict(os.environ, {"TESLA_COUNTRY_URL": "https://www.tesla.com/fr_fr"}):
+        with patch.dict(os.environ, {"TESLA_LOGIN_URL": "https://www.tesla.com/fr_fr/teslaaccount"}):
             self.assertEqual(login_url_from_env(), "https://www.tesla.com/fr_fr/teslaaccount")
-            with patch.dict(os.environ, {"TESLA_LOGIN_URL": "https://www.tesla.com/en_gb/teslaaccount"}):
-                self.assertEqual(login_url_from_env(), "https://www.tesla.com/en_gb/teslaaccount")
 
     def test_country_login_replaces_an_existing_auth_redirect(self):
         page = MagicMock(url="https://auth.tesla.com/en_us/oauth2/v1/authorize")
@@ -175,8 +173,7 @@ class WorkflowTest(unittest.TestCase):
                 sign_in(page, url)
         navigate.assert_called_once_with(page, url)
 
-    def test_country_url_rejects_external_hosts_and_query_strings(self):
-        for url in ("https://www.tesla.com.example.org/de_de/", "https://www.tesla.com/de_de/?next=x"):
-            with patch.dict(os.environ, {"TESLA_COUNTRY_URL": url}):
-                with self.assertRaises(PortalError):
-                    login_url_from_env()
+    def test_login_url_rejects_external_hosts(self):
+        with patch.dict(os.environ, {"TESLA_LOGIN_URL": "https://www.tesla.com.example.org/de_de/"}):
+            with self.assertRaises(PortalError):
+                login_url_from_env()

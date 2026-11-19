@@ -30,14 +30,8 @@ def tesla_url(value):
 
 
 def login_url_from_env():
-    override = os.getenv("TESLA_LOGIN_URL", "").strip()
-    if override:
-        return tesla_url(override)
-    country_url = os.getenv("TESLA_COUNTRY_URL", "https://www.tesla.com/de_de/").strip()
-    parts = urlsplit(tesla_url(country_url))
-    if parts.query or parts.fragment:
-        raise PortalError("TESLA_COUNTRY_URL must not contain a query or fragment")
-    return urljoin(country_url.rstrip("/") + "/", "teslaaccount")
+    url = os.getenv("TESLA_LOGIN_URL", "").strip() or "https://www.tesla.com/de_de/teslaaccount"
+    return tesla_url(url)
 
 
 @dataclass(frozen=True)
