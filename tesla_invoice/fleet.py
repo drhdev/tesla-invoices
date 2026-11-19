@@ -16,6 +16,7 @@ TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 AUTHORIZE_URL = "https://auth.tesla.com/oauth2/v3/authorize"
 CHARGING_URL = FLEET_URL + "/api/1/dx/charging"
 JSON_LIMIT = 4 * 1024 * 1024
+TOKEN_FILE = "fleet-token.json"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -45,12 +46,20 @@ def request_bytes(url, limit, *, token=None, form=None, accept="application/json
 
 
 class Fleet:
+    @staticmethod
+    def is_configured(root):
+        return (
+            bool(os.getenv("TESLA_FLEET_CLIENT_ID", "").strip())
+            and bool(os.getenv("TESLA_FLEET_CLIENT_SECRET", "").strip())
+            and (root / TOKEN_FILE).is_file()
+        )
+
     def __init__(self, root):
         self.client_id = os.getenv("TESLA_FLEET_CLIENT_ID", "")
         self.client_secret = os.getenv("TESLA_FLEET_CLIENT_SECRET", "")
         if not self.client_id or not self.client_secret:
             raise ValueError("Set TESLA_FLEET_CLIENT_ID and TESLA_FLEET_CLIENT_SECRET")
-        self.file = root / "fleet-token.json"
+        self.file = root / TOKEN_FILE
         self.access_token = None
 
     def exchange(self, **grant):

@@ -208,7 +208,10 @@ def download_invoices(db, root, run_id):
 
     supercharger_complete = "supercharger" in completed
     if not supercharger_complete:
-        supercharger_complete = check_fleet(db, root, limit, run_id)
+        if Fleet.is_configured(root):
+            supercharger_complete = check_fleet(db, root, limit, run_id)
+        else:
+            LOG.info("Supercharger web check incomplete. Optional Fleet fallback is not configured")
     return supercharger_complete and "connectivity" in completed
 
 
