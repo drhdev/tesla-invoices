@@ -20,7 +20,7 @@ from uuid import uuid4
 from .archive import Archive
 from .fleet import Fleet
 
-from .portal import LoginRequired, PortalError, Source, collect, goto, is_login, safe_error, tesla_url
+from .portal import LoginRequired, PortalError, Source, collect, goto, is_login, login_url_from_env, safe_error, tesla_url
 
 LOG = logging.getLogger("tesla_invoice")
 CATEGORIES = {"supercharger": "Supercharger", "connectivity": "Premium Connectivity"}
@@ -127,7 +127,7 @@ def save_state(root, state):
 def check_portal(db, root, sources, limit, run_id):
     from playwright.sync_api import sync_playwright
 
-    login_url = tesla_url(os.getenv("TESLA_LOGIN_URL", "https://www.tesla.com/de_DE/teslaaccount"))
+    login_url = login_url_from_env()
     completed = set()
     with sync_playwright() as playwright, closing(playwright.chromium.launch()) as browser:
         for source in sources:
@@ -436,7 +436,7 @@ def schedule():
 def interactive_session(root):
     from playwright.sync_api import sync_playwright
 
-    url = os.getenv("TESLA_LOGIN_URL", "https://www.tesla.com/de_DE/teslaaccount")
+    url = login_url_from_env()
     with sync_playwright() as playwright, closing(playwright.chromium.launch(headless=False)) as browser:
         context = browser.new_context()
         page = context.new_page()

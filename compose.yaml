@@ -7,7 +7,8 @@ services:
     environment:
       TESLA_EMAIL: "${TESLA_EMAIL:-}"
       TESLA_PASSWORD: "${TESLA_PASSWORD:-}"
-      TESLA_LOGIN_URL: "${TESLA_LOGIN_URL:-https://www.tesla.com/de_DE/teslaaccount}"
+      TESLA_COUNTRY_URL: "${TESLA_COUNTRY_URL:-https://www.tesla.com/de_de/}"
+      TESLA_LOGIN_URL: "${TESLA_LOGIN_URL:-}"
       TESLA_FLEET_CLIENT_ID: "${TESLA_FLEET_CLIENT_ID:-}"
       TESLA_FLEET_CLIENT_SECRET: "${TESLA_FLEET_CLIENT_SECRET:-}"
       TESLA_FLEET_REDIRECT_URI: "${TESLA_FLEET_REDIRECT_URI:-}"

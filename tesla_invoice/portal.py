@@ -29,6 +29,17 @@ def tesla_url(value):
     return value
 
 
+def login_url_from_env():
+    override = os.getenv("TESLA_LOGIN_URL", "").strip()
+    if override:
+        return tesla_url(override)
+    country_url = os.getenv("TESLA_COUNTRY_URL", "https://www.tesla.com/de_de/").strip()
+    parts = urlsplit(tesla_url(country_url))
+    if parts.query or parts.fragment:
+        raise PortalError("TESLA_COUNTRY_URL must not contain a query or fragment")
+    return urljoin(country_url.rstrip("/") + "/", "teslaaccount")
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -68,8 +79,7 @@ def is_login(page):
 
 
 def sign_in(page, login_url):
-    if urlsplit(page.url).hostname != "auth.tesla.com":
-        goto(page, login_url)
+    goto(page, login_url)
     if urlsplit(page.url).hostname != "auth.tesla.com":
         raise LoginRequired("Could not verify the Tesla sign-in page")
     email, password = os.getenv("TESLA_EMAIL"), os.getenv("TESLA_PASSWORD")
