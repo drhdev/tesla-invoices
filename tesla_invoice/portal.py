@@ -146,7 +146,7 @@ def collect(page, source, login_url, limit, store, known, save_session):
         sign_in(page, login_url)
         goto(page, source.url)
         if is_login(page):
-            raise LoginRequired("Tesla invoicesbereich verlangt weiterhin eine Anmeldung")
+            raise LoginRequired("The Tesla invoice page still requires sign-in")
 
     listing = page.locator(source.listing).first
     invoices = page.locator(source.invoice)
@@ -186,15 +186,14 @@ def collect(page, source, login_url, limit, store, known, save_session):
             if failures:
                 raise PortalError(f"{failures} PDF downloads failed")
             return
-        before = listing.inner_text()
-        previous_url = page.url
+        before = listing.inner_html()
         next_button.click()
         page.wait_for_function(
-            """({selector, before, url}) => {
+            """({selector, before}) => {
                 const list = document.querySelector(selector);
-                return list && (location.href !== url || list.innerText !== before);
+                return list && list.innerHTML !== before;
             }""",
-            arg={"selector": source.listing, "before": before, "url": previous_url},
+            arg={"selector": source.listing, "before": before},
         )
         ready.wait_for(state="visible")
         tesla_url(page.url)

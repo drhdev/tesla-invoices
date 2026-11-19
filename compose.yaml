@@ -4,16 +4,55 @@ services:
     init: true
     restart: unless-stopped
     shm_size: 256mb
-    env_file: .env
+    environment:
+      TESLA_EMAIL: "${TESLA_EMAIL:-}"
+      TESLA_PASSWORD: "${TESLA_PASSWORD:-}"
+      TESLA_LOGIN_URL: "${TESLA_LOGIN_URL:-https://www.tesla.com/de_DE/teslaaccount}"
+      TESLA_SUPERCHARGER_SOURCE: "${TESLA_SUPERCHARGER_SOURCE:-portal}"
+      TESLA_SUPERCHARGER_URL: "${TESLA_SUPERCHARGER_URL:-}"
+      TESLA_SUPERCHARGER_LIST: "${TESLA_SUPERCHARGER_LIST:-}"
+      TESLA_SUPERCHARGER_INVOICE: "${TESLA_SUPERCHARGER_INVOICE:-}"
+      TESLA_SUPERCHARGER_EMPTY: "${TESLA_SUPERCHARGER_EMPTY:-}"
+      TESLA_SUPERCHARGER_NEXT: "${TESLA_SUPERCHARGER_NEXT:-}"
+      TESLA_SUPERCHARGER_MODE: "${TESLA_SUPERCHARGER_MODE:-download}"
+      TESLA_SUPERCHARGER_ID_ATTRIBUTE: "${TESLA_SUPERCHARGER_ID_ATTRIBUTE:-}"
+      TESLA_CONNECTIVITY_SOURCE: "${TESLA_CONNECTIVITY_SOURCE:-portal}"
+      TESLA_CONNECTIVITY_URL: "${TESLA_CONNECTIVITY_URL:-}"
+      TESLA_CONNECTIVITY_LIST: "${TESLA_CONNECTIVITY_LIST:-}"
+      TESLA_CONNECTIVITY_INVOICE: "${TESLA_CONNECTIVITY_INVOICE:-}"
+      TESLA_CONNECTIVITY_EMPTY: "${TESLA_CONNECTIVITY_EMPTY:-}"
+      TESLA_CONNECTIVITY_NEXT: "${TESLA_CONNECTIVITY_NEXT:-}"
+      TESLA_CONNECTIVITY_MODE: "${TESLA_CONNECTIVITY_MODE:-download}"
+      TESLA_CONNECTIVITY_ID_ATTRIBUTE: "${TESLA_CONNECTIVITY_ID_ATTRIBUTE:-}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_SECURITY: "${SMTP_SECURITY:-starttls}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      MAIL_FROM: "${MAIL_FROM:-}"
+      MAIL_TO: "${MAIL_TO:-}"
+      RUN_DAYS: "${RUN_DAYS:-mon,tue,wed,thu,fri}"
+      RUN_TIME: "${RUN_TIME:-12:00}"
+      RUN_TIMEZONE: "${RUN_TIMEZONE:-Europe/Berlin}"
+      MAX_PDF_BYTES: "${MAX_PDF_BYTES:-10000000}"
+      S3_BUCKET: "${S3_BUCKET:-}"
+      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-eu-central-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
     volumes:
       - invoices:/data
-      - type: bind
-        source: ./inbox
-        target: /inbox
-        read_only: true
-        bind:
-          create_host_path: false
     command: ["schedule"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "tesla_invoice", "health"]
+      interval: 1m
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   invoices:

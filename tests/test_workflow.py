@@ -4,11 +4,14 @@ import smtplib
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, time
+from datetime import datetime, time, timezone
+from email import policy
+from email.parser import BytesParser
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from tesla_invoice.__main__ import database, due_day, run_once, send_pending, store_pdf
+from tesla_invoice.__main__ import archive_pdfs, database, due_day, run_once, send_pending, store_pdf
 from tesla_invoice.portal import PortalError, Source, collect, tesla_url
 
 PDF = b"%PDF-1.4\n%%EOF\n"
@@ -26,6 +29,10 @@ class WorkflowTest(unittest.TestCase):
         temp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temp)
         self.db = self.enterContext(closing(database(self.root)))
+        self.archive = MagicMock()
+        self.archive.bucket = "shared-bucket"
+        self.archive.save.side_effect = lambda category, digest, pdf: f"tesla-invoices/{category}/{digest}.pdf"
+        self.enterContext(patch("tesla_invoice.__main__.Archive", return_value=self.archive))
         self.enterContext(patch.dict(os.environ, {**ENV, "INBOX_DIR": temp}, clear=True))
 
     def client(self):
@@ -51,7 +58,18 @@ class WorkflowTest(unittest.TestCase):
         (self.root / "supercharger" / "b.pdf").write_bytes(PDF + b" ")
         self.assertTrue(run_once(self.db, self.root))
         self.assertEqual(client.data.call_count, 2)
-        self.assertIn(b"Content-Type: application/pdf", client.data.call_args.args[0])
+        message = BytesParser(policy=policy.default).parsebytes(client.data.call_args.args[0])
+        attachment, = message.iter_attachments()
+        retrieved_at, run_id = self.db.execute(
+            "SELECT retrieved_at, run_id FROM retrievals WHERE digest=?", (hashlib.sha256(PDF + b" ").hexdigest(),)
+        ).fetchone()
+        self.assertEqual(attachment.get_payload(decode=True), PDF + b" ")
+        self.assertIn(retrieved_at[:10], message["Subject"])
+        self.assertIn(run_id, message["Subject"])
+        self.assertIn("Hi Heinrich,", message.get_body().get_content())
+        self.assertIn(run_id, message.get_body().get_content())
+        self.assertIn(retrieved_at, message.get_body().get_content())
+        self.assertEqual(self.archive.save.call_count, 2)
         self.assertEqual(self.statuses(), [("sent",), ("sent",)])
 
     def test_invalid_pdf_does_not_block_valid_pdf(self):
@@ -67,8 +85,9 @@ class WorkflowTest(unittest.TestCase):
         client = self.client()
         client.data.side_effect = [(451, b"try again"), (250, b"OK")]
         store_pdf(self.db, "supercharger", PDF)
+        self.assertTrue(archive_pdfs(self.db, self.archive))
         with patch("tesla_invoice.__main__.time.sleep") as sleep:
-            self.assertTrue(send_pending(self.db))
+            self.assertTrue(send_pending(self.db, self.archive.bucket))
         sleep.assert_called_once_with(5)
         self.assertEqual(self.statuses(), [("sent",)])
 
@@ -76,8 +95,9 @@ class WorkflowTest(unittest.TestCase):
         client = self.client()
         client.data.side_effect = smtplib.SMTPServerDisconnected()
         store_pdf(self.db, "supercharger", PDF)
-        self.assertFalse(send_pending(self.db))
-        self.assertTrue(send_pending(self.db))
+        self.assertTrue(archive_pdfs(self.db, self.archive))
+        self.assertFalse(send_pending(self.db, self.archive.bucket))
+        self.assertTrue(send_pending(self.db, self.archive.bucket))
         client.data.assert_called_once()
         self.assertEqual(self.statuses(), [("uncertain",)])
 
@@ -92,9 +112,30 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(status, "uncertain")
         self.assertEqual(invoice_id, "stable-id")
 
-    def test_schedule_uses_most_recent_due_slot(self):
-        self.assertEqual(due_day(datetime(2026, 11, 18, 7), {0, 2, 4}, time(8)), "2026-11-16")
-        self.assertEqual(due_day(datetime(2026, 11, 18, 8), {0, 2, 4}, time(8)), "2026-11-18")
+    def test_no_delivery_before_archive_and_retry_preserves_retrieval(self):
+        client = self.client()
+        store_pdf(self.db, "supercharger", PDF, run_id="original-run")
+        self.archive.save.side_effect = OSError("temporary S3 failure")
+        with patch("tesla_invoice.__main__.time.sleep"):
+            self.assertFalse(run_once(self.db, self.root))
+        client.data.assert_not_called()
+        self.assertEqual(self.statuses(), [("pending",)])
+        self.archive.save.side_effect = None
+        self.archive.save.return_value = "tesla-invoices/supercharger/invoice.pdf"
+        self.assertTrue(run_once(self.db, self.root))
+        client.data.assert_called_once()
+        self.assertIn(b"Run original-run", client.data.call_args.args[0])
+        self.assertEqual(self.statuses(), [("sent",)])
+
+    def test_schedule_follows_berlin_noon_in_winter_and_summer(self):
+        zone = ZoneInfo("Europe/Berlin")
+        days = set(range(5))
+        for utc in (datetime(2026, 11, 18, 11, tzinfo=timezone.utc),
+                    datetime(2026, 7, 15, 10, tzinfo=timezone.utc)):
+            local = utc.astimezone(zone)
+            self.assertIsNone(due_day(local.replace(hour=11), days, time(12)))
+            self.assertEqual(due_day(local, days, time(12)), local.date().isoformat())
+        self.assertIsNone(due_day(datetime(2026, 11, 21, 12, tzinfo=zone), days, time(12)))
 
     def test_portal_skips_known_id_and_stores_new_pdf(self):
         page = MagicMock()

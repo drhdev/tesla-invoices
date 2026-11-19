@@ -9,12 +9,15 @@ import sqlite3
 import ssl
 import time
 from contextlib import closing, contextmanager
-from datetime import datetime, time as wall_time, timedelta
+from datetime import datetime, time as wall_time
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.policy import SMTP
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from uuid import uuid4
+
+from .archive import Archive
 
 from .portal import LoginRequired, Source, collect, goto, is_login, safe_error, tesla_url, validate_pdf
 
@@ -48,6 +51,17 @@ def database(root):
             invoice_id TEXT NOT NULL,
             PRIMARY KEY (category, invoice_id)
         );
+        CREATE TABLE IF NOT EXISTS retrievals (
+            digest TEXT PRIMARY KEY,
+            retrieved_at TEXT NOT NULL,
+            run_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS archives (
+            digest TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            object_key TEXT NOT NULL,
+            PRIMARY KEY (digest, bucket)
+        );
         CREATE TABLE IF NOT EXISTS schedule (
             day TEXT PRIMARY KEY
         );
@@ -57,13 +71,19 @@ def database(root):
     return db
 
 
-def store_pdf(db, category, data, invoice_id=None):
+def store_pdf(db, category, data, invoice_id=None, run_id=None):
+    retrieved_at = datetime.now(ZoneInfo("Europe/Berlin")).isoformat(timespec="seconds")
     digest = hashlib.sha256(data).hexdigest()
     with db:
         result = db.execute(
             "INSERT OR IGNORE INTO invoices(digest, category, pdf) VALUES (?, ?, ?)",
             (digest, category, data),
         )
+        if result.rowcount:
+            db.execute(
+                "INSERT INTO retrievals VALUES (?, ?, ?)",
+                (digest, retrieved_at, run_id or uuid4().hex),
+            )
         if invoice_id:
             db.execute("INSERT OR IGNORE INTO portal_ids VALUES (?, ?)", (category, invoice_id))
     if result.rowcount:
@@ -103,21 +123,21 @@ def save_state(root, state):
     temporary.replace(target)
 
 
-def import_pdfs(db, category, folder, limit):
+def import_pdfs(db, category, folder, limit, run_id):
     success = True
     for path in sorted(folder.glob("*.pdf")):
         try:
             with path.open("rb") as file:
                 data = file.read(limit + 1)
             validate_pdf(data, limit)
-            store_pdf(db, category, data)
+            store_pdf(db, category, data, run_id=run_id)
         except Exception as exc:
             LOG.error("%s: PDF import failed (%s)", category, safe_error(exc))
             success = False
     return success
 
 
-def check_portal(db, root, sources, limit):
+def check_portal(db, root, sources, limit, run_id):
     from playwright.sync_api import sync_playwright
 
     login_url = tesla_url(os.getenv("TESLA_LOGIN_URL", "https://www.tesla.com/de_DE/teslaaccount"))
@@ -138,7 +158,7 @@ def check_portal(db, root, sources, limit):
                     context.set_default_navigation_timeout(30000)
                     collect(
                         context.new_page(), source, login_url, limit,
-                        lambda data, invoice_id: store_pdf(db, source.name, data, invoice_id),
+                        lambda data, invoice_id: store_pdf(db, source.name, data, invoice_id, run_id),
                         known,
                         lambda: save_state(root, context.storage_state(indexed_db=True)),
                     )
@@ -152,15 +172,15 @@ def check_portal(db, root, sources, limit):
     return success
 
 
-def download_invoices(db, root):
+def download_invoices(db, root, run_id):
     limit = int(os.getenv("MAX_PDF_BYTES", "10000000"))
     if limit < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
     sources = []
     success = True
     for category in CATEGORIES:
-        folder = Path(os.getenv("INBOX_DIR", "/inbox")) / category
-        if not import_pdfs(db, category, folder, limit):
+        folder = Path(os.getenv("INBOX_DIR") or root / "inbox") / category
+        if not import_pdfs(db, category, folder, limit, run_id):
             success = False
         try:
             mode = os.getenv(f"TESLA_{category.upper()}_SOURCE", "portal")
@@ -172,7 +192,7 @@ def download_invoices(db, root):
             LOG.error("%s: %s", category, str(exc))
             success = False
     if sources:
-        return check_portal(db, root, sources, limit) and success
+        return check_portal(db, root, sources, limit, run_id) and success
     return success
 
 
@@ -214,31 +234,63 @@ class Mailer:
             client.close()
             raise
 
-    def message(self, digest, category, pdf):
+    def message(self, digest, category, pdf, retrieved_at, run_id):
         name = CATEGORIES[category]
         message = EmailMessage()
         message["From"] = self.sender
         message["To"] = self.recipient
-        message["Subject"] = f"Tesla invoice – {name}"
+        date = datetime.fromisoformat(retrieved_at).astimezone(ZoneInfo("Europe/Berlin")).date().isoformat()
+        filename = f"tesla-{category}-{digest[:12]}.pdf"
+        message["Subject"] = f"Tesla {name} invoice | Retrieved {date} | Run {run_id}"
         message["Message-ID"] = f"<{digest}@tesla-invoice.local>"
-        message.set_content(f"Your Tesla invoice for {name} is attached.")
-        message.add_attachment(pdf, maintype="application", subtype="pdf",
-                               filename=f"tesla-{category}-{digest[:12]}.pdf")
+        message.set_content(
+            f"Hi Heinrich,\n\n"
+            f"Attached is one Tesla {name} invoice ({filename}).\n"
+            f"Retrieved: {retrieved_at}\n"
+            f"Run ID: {run_id}\n"
+        )
+        message.add_attachment(pdf, maintype="application", subtype="pdf", filename=filename)
         return message
 
 
-def send_pending(db):
+def archive_pdfs(db, archive):
     pending = db.execute(
-        "SELECT digest, category FROM invoices WHERE status='pending' ORDER BY rowid"
+        "SELECT digest, category FROM invoices WHERE NOT EXISTS "
+        "(SELECT 1 FROM archives WHERE archives.digest=invoices.digest AND bucket=?)",
+        (archive.bucket,),
+    ).fetchall()
+    success = True
+    for digest, category in pending:
+        pdf, = db.execute("SELECT pdf FROM invoices WHERE digest=?", (digest,)).fetchone()
+        try:
+            key = retry(lambda: archive.save(category, digest, pdf), "S3")
+        except Exception as exc:
+            LOG.error("S3 archive failed for %s (%s)", digest[:12], safe_error(exc))
+            success = False
+            if isinstance(exc, ValueError):
+                continue
+            break
+        with db:
+            db.execute("INSERT INTO archives VALUES (?, ?, ?)", (digest, archive.bucket, key))
+        LOG.info("S3 archive confirmed for %s", digest[:12])
+    return success
+
+
+def send_pending(db, bucket):
+    pending = db.execute(
+        "SELECT i.digest, i.category, r.retrieved_at, r.run_id FROM invoices i "
+        "JOIN archives a ON a.digest=i.digest AND a.bucket=? "
+        "JOIN retrievals r ON r.digest=i.digest WHERE i.status='pending' ORDER BY i.rowid",
+        (bucket,),
     ).fetchall()
     if not pending:
         return True
 
     mailer = Mailer()
     success = True
-    for digest, category in pending:
+    for digest, category, retrieved_at, run_id in pending:
         pdf, = db.execute("SELECT pdf FROM invoices WHERE digest=?", (digest,)).fetchone()
-        message = mailer.message(digest, category, pdf)
+        message = mailer.message(digest, category, pdf, retrieved_at, run_id).as_bytes(policy=SMTP)
 
         def deliver():
             try:
@@ -256,7 +308,7 @@ def send_pending(db):
                         raise smtplib.SMTPResponseException(code, response)
                 update_status(db, digest, "sending")
                 try:
-                    code, response = client.data(message.as_bytes(policy=SMTP))
+                    code, response = client.data(message)
                     if code != 250:
                         raise smtplib.SMTPDataError(code, response)
                 except smtplib.SMTPResponseException:
@@ -286,55 +338,86 @@ def send_pending(db):
 
 
 def run_once(db, root, download_only=False):
+    run_id = uuid4().hex
+    LOG.info("Invoice check started (run %s)", run_id)
+    # Legacy entries recorded their most recent status update rather than their discovery time.
+    with db:
+        db.execute(
+            "INSERT OR IGNORE INTO retrievals "
+            "SELECT digest, updated || 'Z', ? FROM invoices",
+            (run_id,),
+        )
     try:
-        downloaded = download_invoices(db, root)
+        downloaded = download_invoices(db, root, run_id)
     except Exception as exc:
         LOG.error("Could not start the Tesla check (%s)", safe_error(exc))
         downloaded = False
-    if download_only:
-        return downloaded
     try:
-        sent = send_pending(db)
+        archive = Archive()
+        archived = archive_pdfs(db, archive)
+    except Exception as exc:
+        LOG.error("Could not start S3 archival (%s)", safe_error(exc))
+        return False
+    if download_only:
+        return downloaded and archived
+    try:
+        sent = send_pending(db, archive.bucket)
     except Exception as exc:
         LOG.error("Could not start email delivery (%s)", safe_error(exc))
         sent = False
     uncertain, = db.execute("SELECT count(*) FROM invoices WHERE status='uncertain'").fetchone()
     if uncertain:
         LOG.warning("%d deliveries have uncertain status. Use the status command to inspect them", uncertain)
-    return downloaded and sent
+    return downloaded and archived and sent and not uncertain
 
 
 def due_day(now, days, scheduled_time):
-    for offset in range(8):
-        day = now.date() - timedelta(days=offset)
-        if day.weekday() in days and (offset or now.time() >= scheduled_time):
-            return day.isoformat()
-    raise ValueError("No valid weekday found")
+    if now.weekday() in days and now.time() >= scheduled_time:
+        return now.date().isoformat()
+    return None
 
 
 def schedule():
-    days = {WEEKDAYS[day.strip().lower()] for day in os.getenv("RUN_DAYS", "mon,wed,fri").split(",")}
-    scheduled_time = wall_time.fromisoformat(os.getenv("RUN_TIME", "08:00"))
+    days = {WEEKDAYS[day.strip().lower()] for day in os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri").split(",")}
+    scheduled_time = wall_time.fromisoformat(os.getenv("RUN_TIME", "12:00"))
     if scheduled_time.tzinfo is not None:
         raise ValueError("RUN_TIME must be a local time without a UTC offset")
     zone = ZoneInfo(os.getenv("RUN_TIMEZONE", "Europe/Berlin"))
-    LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,wed,fri"), scheduled_time, zone)
+    if not os.getenv("S3_BUCKET", "").strip():
+        raise ValueError("S3_BUCKET is required")
+    Mailer()
+    if int(os.getenv("MAX_PDF_BYTES", "10000000")) < 1:
+        raise ValueError("MAX_PDF_BYTES must be positive")
+    root = Path(os.getenv("DATA_DIR", "/data"))
+    for category in CATEGORIES:
+        mode = os.getenv(f"TESLA_{category.upper()}_SOURCE", "portal")
+        if mode == "portal":
+            Source.from_env(category)
+        elif mode == "inbox":
+            (Path(os.getenv("INBOX_DIR") or root / "inbox") / category).mkdir(parents=True, exist_ok=True)
+        else:
+            raise ValueError(f"{category}: source must be portal or inbox")
+    LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri"), scheduled_time, zone)
     while True:
-        delay = 30
+        delay = 15
         day = due_day(datetime.now(zone), days, scheduled_time)
-        try:
-            with locked_data() as root, closing(database(root)) as db:
-                completed = db.execute("SELECT 1 FROM schedule WHERE day=?", (day,)).fetchone()
-                if not completed:
-                    LOG.info("Checking invoices for scheduled date %s", day)
-                    if run_once(db, root):
-                        with db:
-                            db.execute("INSERT INTO schedule(day) VALUES (?)", (day,))
-                    else:
-                        delay = 1800
-                        LOG.warning("Check incomplete. Retrying in %d minutes", delay // 60)
-        except BlockingIOError:
-            LOG.info("Another process holds the data directory lock")
+        if day:
+            try:
+                with locked_data() as root, closing(database(root)) as db:
+                    completed = db.execute("SELECT 1 FROM schedule WHERE day=?", (day,)).fetchone()
+                    if not completed:
+                        LOG.info("Checking invoices for scheduled date %s", day)
+                        unhealthy = root / "worker-unhealthy"
+                        if run_once(db, root):
+                            with db:
+                                db.execute("INSERT INTO schedule(day) VALUES (?)", (day,))
+                            unhealthy.unlink(missing_ok=True)
+                        else:
+                            unhealthy.touch()
+                            delay = 1800
+                            LOG.warning("Check incomplete. Retrying in %d minutes", delay // 60)
+            except BlockingIOError:
+                LOG.info("Another process holds the data directory lock")
         time.sleep(delay)
 
 
@@ -362,13 +445,16 @@ def main():
     mode = run.add_mutually_exclusive_group()
     mode.add_argument("--download-only", action="store_true")
     mode.add_argument("--baseline", action="store_true")
-    for name in ("schedule", "status", "login", "import-session"):
+    for name in ("schedule", "status", "login", "import-session", "health"):
         commands.add_parser(name)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("digest")
     resolve.add_argument("status", choices=("sent", "pending"))
     args = parser.parse_args()
     try:
+        if args.command == "health":
+            root = Path(os.getenv("DATA_DIR", "/data"))
+            return int((root / "worker-unhealthy").exists() or not os.access(root, os.W_OK))
         if args.command == "schedule":
             schedule()
             return 0
@@ -400,7 +486,11 @@ def main():
                 if args.command == "status":
                     for row in db.execute("SELECT status, count(*) FROM invoices GROUP BY status"):
                         print(*row)
-                    for row in db.execute("SELECT digest, category, updated FROM invoices WHERE status='uncertain'"):
+                    for row in db.execute(
+                        "SELECT i.status, i.digest, i.category, i.updated, r.retrieved_at, r.run_id "
+                        "FROM invoices i LEFT JOIN retrievals r ON r.digest=i.digest "
+                        "WHERE i.status IN ('pending', 'uncertain') ORDER BY i.rowid"
+                    ):
                         print(*row)
                 if args.command == "resolve":
                     with db:
@@ -417,7 +507,7 @@ def main():
         LOG.error("Another invoice check holds the data directory lock")
         return 1
     except (ValueError, KeyError) as exc:
-        LOG.error("Invalid configuration or input (%s)", type(exc).__name__)
+        LOG.error("Invalid configuration or input (%s)", safe_error(exc))
         return 1
     except Exception as exc:
         LOG.error("Command failed (%s)", safe_error(exc))
