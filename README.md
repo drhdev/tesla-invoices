@@ -126,18 +126,20 @@ Treat the session file as a credential. Export `TESLA_LOGIN_URL` on the desktop 
 
 ## Uptime Kuma
 
-The optional heartbeat sends a status every **30 seconds**, including weekends and idle periods. It reports `down` if the latest scheduled check is incomplete, the data volume is unwritable, or the scheduler has stopped progressing for **3600 seconds**. Kuma detects an offline worker when pushes stop arriving. Push failures are logged and retried at the next interval without interrupting invoice processing.
+The optional heartbeat sends a status once **per hour**, including weekends and idle periods. It reports `down` if the latest scheduled check is incomplete, the data volume is unwritable, or the scheduler has stopped progressing for **3600 seconds**. Kuma detects an offline worker when pushes stop arriving. Push failures are logged and retried at the next interval without interrupting invoice processing.
 
 1. In Uptime Kuma, select **Add New Monitor → Push**. Name it **Tesla Invoices**.
-2. Set **Heartbeat Interval** to **90 seconds** for the default 30-second worker interval. Select a notification channel and save.
+2. Set **Heartbeat Interval** to **5400 seconds (90 minutes)** for the default hourly worker interval. Select a notification channel and save.
 3. Copy the monitor's **Push URL** into the Coolify runtime variable `KUMA_PUSH_URL` and redeploy. An HTTPS URL such as `https://kuma.example.com/api/push/<token>` should be reachable from the worker. Keep the embedded token private.
 4. Verify that the logs show `Uptime Kuma heartbeat enabled` and that Kuma receives an **Up** heartbeat. To test alerting, stop a test worker and confirm that Kuma reports missing pushes. Restart it and check for recovery.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `KUMA_PUSH_URL` | Empty | Push monitor URL. Leave blank to disable monitoring. |
-| `KUMA_PUSH_INTERVAL_SECONDS` | `30` | Interval between pushes. Set Kuma's interval above this value. |
+| `KUMA_PUSH_INTERVAL_SECONDS` | `3600` | Interval between pushes in seconds. Set Kuma's interval above this value. |
 | `KUMA_STALE_SECONDS` | `3600` | Time without scheduler progress before reporting `down`. Increase it if a normal history scan takes longer. |
+
+If you previously set a shorter interval explicitly, update `KUMA_PUSH_INTERVAL_SECONDS` in Coolify and the monitor interval in Kuma. Failed runs are reported with the next scheduled push.
 
 An **Up** heartbeat between runs confirms scheduler health. Check the logs to verify the latest invoice run. [Uptime Kuma Push endpoint](https://github.com/louislam/uptime-kuma/wiki/Internal-API#push-endpoint)
 

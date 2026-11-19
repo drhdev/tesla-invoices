@@ -31,10 +31,10 @@ class Heartbeat:
         ):
             raise ValueError("KUMA_PUSH_URL must be an Uptime Kuma Push monitor URL")
         self.port = self.endpoint.port
-        self.interval = int(os.getenv("KUMA_PUSH_INTERVAL_SECONDS", "30"))
+        self.interval = int(os.getenv("KUMA_PUSH_INTERVAL_SECONDS", "3600"))
         self.stale = int(os.getenv("KUMA_STALE_SECONDS", "3600"))
-        if not 10 <= self.interval < self.stale or self.stale <= 15:
-            raise ValueError("Kuma interval must be at least 10 seconds and below the stale threshold")
+        if self.interval < 10 or self.stale <= 15:
+            raise ValueError("Kuma interval must be at least 10 seconds and the stale threshold must exceed 15 seconds")
         self.thread = Thread(target=self.run, name="kuma-heartbeat", daemon=True)
 
     def __enter__(self):

@@ -23,6 +23,10 @@ class HeartbeatTest(unittest.TestCase):
         with Heartbeat(self.root) as heartbeat:
             self.assertIsNone(heartbeat.thread)
 
+    def test_default_interval_is_one_hour(self):
+        heartbeat = self.heartbeat()
+        self.assertEqual(heartbeat.interval, 3600)
+
     def test_reports_idle_failure_and_stall(self):
         heartbeat = self.heartbeat()
         self.assertEqual(heartbeat.status()[0], "up")
