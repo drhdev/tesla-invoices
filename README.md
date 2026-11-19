@@ -2,14 +2,42 @@
 
 A Python service that checks for Tesla Supercharger and Premium Connectivity invoices and emails new PDFs via SMTP. By default it runs on weekdays at 12:00 Europe/Berlin time. A persistent Docker volume stores the invoice database, delivery history, and Tesla browser session. Each PDF is archived in S3 before it can be emailed.
 
+[How it works](#how-it-works) · [Deploy on Coolify](#deploy-on-coolify) · [Configuration](#configuration) · [Uptime Kuma](#uptime-kuma) · [Local setup](#local-setup) · [Troubleshooting](#troubleshooting)
+
+## How it works
+
+1. The worker signs in to the Tesla web account, checks both invoice lists, and follows their configured pagination. The Fleet API is an optional fallback for Supercharger invoices.
+2. SQLite stores each PDF with its SHA-256 digest, first retrieval timestamp, run ID, and delivery status. The digest prevents byte-identical PDFs from being queued again.
+3. The worker archives the PDF under `tesla-invoices/<category>/<sha256>.pdf` in S3. It verifies the contents when the key already exists.
+4. After archival, the worker sends one English email per new invoice to the configured recipient. The email greets Heinrich and includes the invoice category, PDF attachment, retrieval date, and run ID.
+
 ## Deploy on Coolify
 
+You need a Tesla account with invoice access, an SMTP account, an existing S3 bucket, and a Coolify server with outbound access to those services.
+
 1. Create an application using **Docker Compose** from this repository. Select branch `main` and Compose file `/compose.yaml`. This is a background worker. It needs a single replica, the persistent `invoices` volume mounted at `/data`, and no public domain, port, or Coolify scheduled task. Keep the same volume on redeploy and include it in backups.
-2. Configure the variables from [`.env.example`](.env.example) in Coolify as runtime settings. Set `MAIL_TO` to Heinrich's email address. Set the Tesla login URL, invoice sources, SMTP settings, and S3 settings described below. Supply credentials through Coolify's environment settings and keep them out of the repository.
+2. Configure the variables from [`.env.example`](.env.example) in Coolify as runtime settings. Set `MAIL_TO` to Heinrich's email address. Set the Tesla login URL, invoice sources, SMTP settings, and S3 settings described below. Add `KUMA_PUSH_URL` if you use [Uptime Kuma](#uptime-kuma). Supply credentials through Coolify's environment settings and keep them out of the repository.
 3. Deploy and check that the logs say `Schedule active`. The worker starts the day's check at noon Berlin time, including daylight saving changes. If started later on an eligible day, it runs that day's outstanding check. Failed checks retry after 30 minutes during the active window. The next eligible check discovers invoices published during missed days and resumes locally queued deliveries.
-4. If you want the Supercharger fallback available, complete the one-time [Tesla Fleet authorization](#supercharger-fallback). In the worker terminal, run `python -m tesla_invoice run --download-only` to verify portal and S3 access. Use `python -m tesla_invoice status` to inspect queued invoices. Then run `python -m tesla_invoice run` to verify actual SMTP delivery with the configured recipient. Run these commands while a scheduled check is idle. On a fresh deployment after noon, the scheduler can already have started a delivery run, so deploy before noon or on a weekend if you need to verify without sending first.
+4. If you want the Supercharger fallback available, complete the one-time [Tesla Fleet authorization](#supercharger-fallback). In the worker terminal, run `python -m tesla_invoice run --download-only` to verify portal and S3 access. Use `python -m tesla_invoice status` to inspect queued invoices. Then run `python -m tesla_invoice run` to verify actual SMTP delivery with the configured recipient. Run these commands while a scheduled check is idle. On a fresh deployment after noon, the scheduler can already have started a delivery run, so deploy before noon or on an unscheduled day if you need to verify without sending first.
+
+> [!IMPORTANT]
+> The first delivery includes older invoices found during the initial scan. To archive that history and email only newly discovered invoices, run `python -m tesla_invoice run --baseline` before the first delivery.
 
 [Coolify Docker Compose documentation](https://coolify.io/docs/knowledge-base/docker/compose)
+
+## Configuration
+
+Use [`.env.example`](.env.example) as the configuration reference. Set these as runtime variables in Coolify, or put them in a local `.env` for Docker Compose.
+
+| Settings | Purpose |
+| --- | --- |
+| `TESLA_LOGIN_URL`, `TESLA_EMAIL`, `TESLA_PASSWORD` | Web sign-in. The URL defaults to the German Tesla account page. |
+| `TESLA_CONNECTIVITY_*`, `TESLA_SUPERCHARGER_*` | Invoice page URLs and selectors. See [Tesla web sources](#tesla-web-sources). |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY` | Mail server and transport. Use `starttls` with port 587 or `ssl` with port 465 as required by your provider. |
+| `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`, `MAIL_TO` | SMTP credentials and sender/recipient addresses. Use one address per field. |
+| `S3_BUCKET`, `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Shared archive configuration. Set the session token for temporary credentials. |
+| `RUN_DAYS`, `RUN_TIME`, `RUN_TIMEZONE` | Defaults are `mon,tue,wed,thu,fri`, `12:00`, and `Europe/Berlin`. |
+| `MAX_PDF_BYTES` | Defaults to 10,000,000 bytes. Set within your SMTP provider's limit, allowing for MIME encoding overhead. |
 
 ### Shared S3 bucket
 
@@ -19,9 +47,25 @@ The policy permits only object reads and writes under `tesla-invoices/`. It deni
 
 Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload prevents overwriting an existing object. If the object already exists, the service verifies its contents before marking it archived. Exclude the invoice prefix from any shared lifecycle rule that expires objects sooner than your required retention period. The S3 archive contains PDFs. Preserve the SQLite database separately to retain delivery history.
 
+### Tesla web sources
+
+Configure both invoice sources in the signed-in Tesla web account. For Premium Connectivity, use **Manage Vehicle → Documents**. For Supercharging, use the charging invoice list if your web account exposes it. The [Tesla Fleet fallback](#supercharger-fallback) can cover Supercharger retrieval when that list is unavailable. [Premium Connectivity support](https://www.tesla.com/support/connectivity)
+
+| Setting | Value |
+| --- | --- |
+| `URL` | HTTPS URL on Tesla.com for the invoice list after signing in |
+| `LIST` | CSS selector for the visible list container |
+| `INVOICE` | CSS selector for PDF links or download buttons in this category |
+| `EMPTY` | CSS selector for the empty-state message, if available |
+| `NEXT` | CSS selector for the next-page or load-more control, if available |
+| `MODE` | `download` for buttons that trigger a browser download or `href` for direct PDF links on Tesla.com |
+| `ID_ATTRIBUTE` | Optional attribute that holds a stable, unique invoice ID, such as `data-invoice-id` |
+
+Use the `TESLA_CONNECTIVITY_` and `TESLA_SUPERCHARGER_` prefixes for the respective web sources. An existing `TESLA_SUPERCHARGER_SOURCE` setting can be removed when upgrading. Sign in to your Tesla account and use your browser's developer tools to find the URL and selectors. Match only invoices for the requested category, since the Documents page can contain other records. Without a stable ID, the service downloads the visible PDFs again and deduplicates them by content. Use `ID_ATTRIBUTE` if Tesla assigns a new ID to each invoice revision or if you only need one version per ID.
+
 ## Local setup
 
-1. Create the local configuration and import directories.
+1. Create the local configuration file.
 
    ```sh
    umask 077
@@ -30,21 +74,7 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
 
 2. Enter your Tesla credentials, SMTP settings, and the shared-bucket settings in `.env`. Set `TESLA_LOGIN_URL` to the full Tesla account login URL for your country. It defaults to `https://www.tesla.com/de_de/teslaaccount` for Germany and applies to both automatic and interactive sign-in. Set `MAIL_FROM` and `MAIL_TO` to one email address each. Use `SMTP_SECURITY=starttls` for port 587 or `SMTP_SECURITY=ssl` for port 465, as required by your provider. Put passwords containing `$` or `#` in single quotes in the Compose environment file. Both the file and the Docker volume contain sensitive data.
 
-3. Configure both invoice sources in the signed-in Tesla web account. For Premium Connectivity, use **Manage Vehicle → Documents**. For Supercharging, use the charging invoice list if your web account exposes it. The [Tesla Fleet fallback](#supercharger-fallback) can cover Supercharger retrieval when that list is unavailable. [Premium Connectivity support](https://www.tesla.com/support/connectivity)
-
-   | Setting | Value |
-   | --- | --- |
-   | `URL` | HTTPS URL on Tesla.com for the invoice list after signing in |
-   | `LIST` | CSS selector for the visible list container |
-   | `INVOICE` | CSS selector for PDF links or download buttons in this category |
-   | `EMPTY` | CSS selector for the empty-state message, if available |
-   | `NEXT` | CSS selector for the next-page or load-more control, if available |
-   | `MODE` | `download` for buttons that trigger a browser download or `href` for direct PDF links on Tesla.com |
-   | `ID_ATTRIBUTE` | Optional attribute that holds a stable, unique invoice ID, such as `data-invoice-id` |
-
-   Use the `TESLA_CONNECTIVITY_` and `TESLA_SUPERCHARGER_` prefixes for the respective web sources. An existing `TESLA_SUPERCHARGER_SOURCE` setting can be removed when upgrading. Sign in to your Tesla account and use your browser's developer tools to find the URL and selectors. Match only invoices for the requested category, since the Documents page can contain other records. Without a stable ID, the service downloads the visible PDFs again and deduplicates them by content. Use `ID_ATTRIBUTE` if Tesla assigns a new ID to each invoice revision or if you only need one version per ID.
-
-4. Verify the setup without sending email.
+3. Verify the setup without sending email.
 
    ```sh
    docker compose build
@@ -54,7 +84,7 @@ Keys follow `tesla-invoices/<category>/<sha256>.pdf`. A conditional upload preve
 
    The first run collects every PDF found in the configured Tesla sources, including older invoices. The first delivery run sends one email per collected invoice. If you only want invoices discovered after setup, run `docker compose run --rm invoices run --baseline` before starting the service. This saves existing PDFs without queuing them for delivery.
 
-5. Start the service.
+4. Start the service.
 
    ```sh
    docker compose up -d
@@ -75,7 +105,7 @@ Premium Connectivity uses the Tesla web account session independently of Fleet a
 
 ## Sign-in with MFA
 
-The Premium Connectivity web source reuses the saved browser session and tries the configured credentials when sign-in is required. If Tesla prompts for MFA, a CAPTCHA, or another interactive check, sign in with the browser opened by the following commands on a Linux desktop with Python installed. Return to the signed-in account page before saving the session. When the session expires, repeat the import if interactive verification is still required.
+Both Tesla web sources reuse the saved browser session and try the configured credentials when sign-in is required. If Tesla prompts for MFA, a CAPTCHA, or another interactive check, sign in with the browser opened by the following commands on a Linux desktop with Python installed. Return to the signed-in account page before saving the session. When the session expires, repeat the import if interactive verification is still required.
 
 ```sh
 python -m venv .venv
@@ -86,7 +116,32 @@ DATA_DIR=./data python -m tesla_invoice login
 docker compose run --rm -T invoices import-session < data/session.json
 ```
 
-## Retries and delivery status
+For Coolify, import the session into the running container over SSH instead of the last local Compose command:
+
+```sh
+ssh coolify-host.example.com 'docker exec -i worker-container python -m tesla_invoice import-session' < data/session.json
+```
+
+Treat the session file as a credential. Export `TESLA_LOGIN_URL` on the desktop before running the login command if you use a custom URL.
+
+## Uptime Kuma
+
+The optional heartbeat sends a status every **30 seconds**, including weekends and idle periods. It reports `down` if the latest scheduled check is incomplete, the data volume is unwritable, or the scheduler has stopped progressing for **3600 seconds**. Kuma detects an offline worker when pushes stop arriving. Push failures are logged and retried at the next interval without interrupting invoice processing.
+
+1. In Uptime Kuma, select **Add New Monitor → Push**. Name it **Tesla Invoices**.
+2. Set **Heartbeat Interval** to **90 seconds** for the default 30-second worker interval. Select a notification channel and save.
+3. Copy the monitor's **Push URL** into the Coolify runtime variable `KUMA_PUSH_URL` and redeploy. An HTTPS URL such as `https://kuma.example.com/api/push/<token>` should be reachable from the worker. Keep the embedded token private.
+4. Verify that the logs show `Uptime Kuma heartbeat enabled` and that Kuma receives an **Up** heartbeat. To test alerting, stop a test worker and confirm that Kuma reports missing pushes. Restart it and check for recovery.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `KUMA_PUSH_URL` | Empty | Push monitor URL. Leave blank to disable monitoring. |
+| `KUMA_PUSH_INTERVAL_SECONDS` | `30` | Interval between pushes. Set Kuma's interval above this value. |
+| `KUMA_STALE_SECONDS` | `3600` | Time without scheduler progress before reporting `down`. Increase it if a normal history scan takes longer. |
+
+An **Up** heartbeat between runs confirms scheduler health. Check the logs to verify the latest invoice run. [Uptime Kuma Push endpoint](https://github.com/louislam/uptime-kuma/wiki/Internal-API#push-endpoint)
+
+## Troubleshooting
 
 - The service retries temporary download, S3, and SMTP errors. A failed scheduled check sets the worker health check to unhealthy until a subsequent successful check. Successfully saved PDFs remain queued. Only invoices confirmed in S3 can be emailed.
 - SQLite deduplicates byte-identical PDFs by SHA-256 and preserves their first retrieval date and run ID across retries. Each English email to Heinrich contains one PDF, a short description, and the retrieval date and run ID in both the subject and body. The service marks an invoice `sent` when the SMTP server accepts it. Pending records created by older versions use their last recorded timestamp and first upgrade run ID because those versions did not record retrieval metadata.
@@ -98,3 +153,19 @@ docker compose run --rm invoices resolve HASH pending
 ```
 
 Monitor Coolify logs and resolve uncertain deliveries promptly. SMTP can acknowledge a message even when the client loses the acknowledgement. A recorded SMTP acceptance also does not guarantee inbox delivery, so check mail-provider bounce logs. The worker can only collect invoices exposed by the configured Tesla sources and cannot detect an invoice Tesla never lists. Check both configured categories against your account before relying on the deployment. Retain the Docker volume and its backups so already sent invoices stay recorded.
+
+## Tests
+
+Run from the repository root with Python 3.12 or later:
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+docker compose config -q
+```
+
+## License
+
+[GNU General Public License v3.0](LICENSE)

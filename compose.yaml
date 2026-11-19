@@ -41,6 +41,9 @@ services:
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
       AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      KUMA_PUSH_URL: "${KUMA_PUSH_URL:-}"
+      KUMA_PUSH_INTERVAL_SECONDS: "${KUMA_PUSH_INTERVAL_SECONDS:-30}"
+      KUMA_STALE_SECONDS: "${KUMA_STALE_SECONDS:-3600}"
     volumes:
       - invoices:/data
     command: ["schedule"]

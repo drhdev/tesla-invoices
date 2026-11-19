@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from .archive import Archive
 from .fleet import Fleet
+from .heartbeat import Heartbeat, UNHEALTHY_FILE
 
 from .portal import LoginRequired, PortalError, Source, collect, goto, is_login, login_url_from_env, safe_error, tesla_url
 
@@ -410,27 +411,31 @@ def schedule():
     root = Path(os.getenv("DATA_DIR", "/data"))
     Source.from_env("connectivity")
     LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri"), scheduled_time, zone)
-    while True:
-        delay = 15
-        day = due_day(datetime.now(zone), days, scheduled_time)
-        if day:
-            try:
-                with locked_data() as root, closing(database(root)) as db:
-                    completed = db.execute("SELECT 1 FROM schedule WHERE day=?", (day,)).fetchone()
-                    if not completed:
-                        LOG.info("Checking invoices for scheduled date %s", day)
-                        unhealthy = root / "worker-unhealthy"
-                        if run_once(db, root):
-                            with db:
-                                db.execute("INSERT INTO schedule(day) VALUES (?)", (day,))
-                            unhealthy.unlink(missing_ok=True)
-                        else:
-                            unhealthy.touch()
-                            delay = 1800
-                            LOG.warning("Check incomplete. Retrying in %d minutes", delay // 60)
-            except BlockingIOError:
-                LOG.info("Another process holds the data directory lock")
-        time.sleep(delay)
+    failed_day = None
+    retry_at = 0
+    with Heartbeat(root) as heartbeat:
+        while True:
+            heartbeat.tick()
+            day = due_day(datetime.now(zone), days, scheduled_time)
+            if day and (day != failed_day or time.monotonic() >= retry_at):
+                try:
+                    with locked_data() as locked_root, closing(database(locked_root)) as db:
+                        completed = db.execute("SELECT 1 FROM schedule WHERE day=?", (day,)).fetchone()
+                        if not completed:
+                            LOG.info("Checking invoices for scheduled date %s", day)
+                            unhealthy = locked_root / UNHEALTHY_FILE
+                            if run_once(db, locked_root):
+                                unhealthy.unlink(missing_ok=True)
+                                with db:
+                                    db.execute("INSERT INTO schedule(day) VALUES (?)", (day,))
+                            else:
+                                unhealthy.touch()
+                                failed_day = day
+                                retry_at = time.monotonic() + 1800
+                                LOG.warning("Check incomplete. Retrying in 30 minutes")
+                except BlockingIOError:
+                    LOG.info("Another process holds the data directory lock")
+            time.sleep(15)
 
 
 def interactive_session(root):
@@ -466,7 +471,7 @@ def main():
     try:
         if args.command == "health":
             root = Path(os.getenv("DATA_DIR", "/data"))
-            return int((root / "worker-unhealthy").exists() or not os.access(root, os.W_OK))
+            return int((root / UNHEALTHY_FILE).exists() or not os.access(root, os.W_OK))
         if args.command == "schedule":
             schedule()
             return 0
