@@ -1,0 +1,127 @@
+import hashlib
+import os
+import smtplib
+import tempfile
+import unittest
+from contextlib import closing
+from datetime import datetime, time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from tesla_invoice.__main__ import database, due_day, run_once, send_pending, store_pdf
+from tesla_invoice.portal import PortalError, Source, collect, tesla_url
+
+PDF = b"%PDF-1.4\n%%EOF\n"
+ENV = {
+    "SMTP_HOST": "smtp.example.com",
+    "MAIL_FROM": "sender@example.com",
+    "MAIL_TO": "recipient@example.com",
+    "TESLA_SUPERCHARGER_SOURCE": "inbox",
+    "TESLA_CONNECTIVITY_SOURCE": "inbox",
+}
+
+
+class WorkflowTest(unittest.TestCase):
+    def setUp(self):
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(temp)
+        self.db = self.enterContext(closing(database(self.root)))
+        self.enterContext(patch.dict(os.environ, {**ENV, "INBOX_DIR": temp}, clear=True))
+
+    def client(self):
+        client = MagicMock()
+        client.mail.return_value = (250, b"OK")
+        client.rcpt.return_value = (250, b"OK")
+        client.data.return_value = (250, b"OK")
+        self.enterContext(patch("tesla_invoice.__main__.Mailer.connect", return_value=client))
+        return client
+
+    def statuses(self):
+        return self.db.execute("SELECT status FROM invoices ORDER BY rowid").fetchall()
+
+    def test_new_pdfs_only_are_sent(self):
+        client = self.client()
+        for category in ("supercharger", "connectivity"):
+            (self.root / category).mkdir()
+        (self.root / "connectivity" / "a.pdf").write_bytes(PDF)
+        self.assertTrue(run_once(self.db, self.root, download_only=True))
+        client.data.assert_not_called()
+        self.assertTrue(run_once(self.db, self.root))
+        (self.root / "connectivity" / "duplicate.pdf").write_bytes(PDF)
+        (self.root / "supercharger" / "b.pdf").write_bytes(PDF + b" ")
+        self.assertTrue(run_once(self.db, self.root))
+        self.assertEqual(client.data.call_count, 2)
+        self.assertIn(b"Content-Type: application/pdf", client.data.call_args.args[0])
+        self.assertEqual(self.statuses(), [("sent",), ("sent",)])
+
+    def test_invalid_pdf_does_not_block_valid_pdf(self):
+        client = self.client()
+        (self.root / "connectivity").mkdir()
+        (self.root / "connectivity" / "a.pdf").write_bytes(b"<html>Sign in</html>")
+        (self.root / "connectivity" / "b.pdf").write_bytes(PDF)
+        self.assertFalse(run_once(self.db, self.root))
+        client.data.assert_called_once()
+        self.assertEqual(self.statuses(), [("sent",)])
+
+    def test_explicit_smtp_rejection_is_retried(self):
+        client = self.client()
+        client.data.side_effect = [(451, b"try again"), (250, b"OK")]
+        store_pdf(self.db, "supercharger", PDF)
+        with patch("tesla_invoice.__main__.time.sleep") as sleep:
+            self.assertTrue(send_pending(self.db))
+        sleep.assert_called_once_with(5)
+        self.assertEqual(self.statuses(), [("sent",)])
+
+    def test_disconnect_after_data_is_not_retried(self):
+        client = self.client()
+        client.data.side_effect = smtplib.SMTPServerDisconnected()
+        store_pdf(self.db, "supercharger", PDF)
+        self.assertFalse(send_pending(self.db))
+        self.assertTrue(send_pending(self.db))
+        client.data.assert_called_once()
+        self.assertEqual(self.statuses(), [("uncertain",)])
+
+    def test_interrupted_send_is_recovered_as_uncertain(self):
+        store_pdf(self.db, "supercharger", PDF, "stable-id")
+        with self.db:
+            self.db.execute("UPDATE invoices SET status='sending'")
+        with closing(database(self.root)) as reopened:
+            digest, status = reopened.execute("SELECT digest, status FROM invoices").fetchone()
+            invoice_id, = reopened.execute("SELECT invoice_id FROM portal_ids").fetchone()
+        self.assertEqual(digest, hashlib.sha256(PDF).hexdigest())
+        self.assertEqual(status, "uncertain")
+        self.assertEqual(invoice_id, "stable-id")
+
+    def test_schedule_uses_most_recent_due_slot(self):
+        self.assertEqual(due_day(datetime(2026, 11, 18, 7), {0, 2, 4}, time(8)), "2026-11-16")
+        self.assertEqual(due_day(datetime(2026, 11, 18, 8), {0, 2, 4}, time(8)), "2026-11-18")
+
+    def test_portal_skips_known_id_and_stores_new_pdf(self):
+        page = MagicMock()
+        url = "https://www.tesla.com/de_DE/teslaaccount"
+        page.url = url
+        container, invoices, password = MagicMock(), MagicMock(), MagicMock()
+        password.first.is_visible.return_value = False
+        page.locator.side_effect = {
+            "#invoices": container,
+            "#invoices a": invoices,
+            "input[type=password]": password,
+        }.__getitem__
+        invoices.count.return_value = 2
+        items = [MagicMock(), MagicMock()]
+        items[0].get_attribute.return_value = "known"
+        items[1].get_attribute.return_value = "new"
+        invoices.nth.side_effect = items.__getitem__
+        source = Source("connectivity", url, "#invoices", "#invoices a", "", "", "href", "data-id")
+        save_session, store = MagicMock(), MagicMock()
+        with patch("tesla_invoice.portal.goto"), patch("tesla_invoice.portal.get_pdf", return_value=PDF) as fetch:
+            collect(page, source, url, 1000, store, lambda value: value == "known", save_session)
+        fetch.assert_called_once_with(page, items[1], "href", 1000)
+        store.assert_called_once_with(PDF, "new")
+        save_session.assert_called_once()
+
+    def test_tesla_url_blocks_lookalike_and_cleartext_hosts(self):
+        for url in ("https://tesla.com.example.org", "http://auth.tesla.com", "https://tesla.com@other.org"):
+            with self.assertRaises(PortalError):
+                tesla_url(url)
+        self.assertEqual(tesla_url("https://auth.tesla.com"), "https://auth.tesla.com")

@@ -1,0 +1,4 @@
+*
+!requirements.txt
+!tesla_invoice/
+!tesla_invoice/*.py

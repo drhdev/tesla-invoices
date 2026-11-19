@@ -1,0 +1,19 @@
+services:
+  invoices:
+    build: .
+    init: true
+    restart: unless-stopped
+    shm_size: 256mb
+    env_file: .env
+    volumes:
+      - invoices:/data
+      - type: bind
+        source: ./inbox
+        target: /inbox
+        read_only: true
+        bind:
+          create_host_path: false
+    command: ["schedule"]
+
+volumes:
+  invoices:
