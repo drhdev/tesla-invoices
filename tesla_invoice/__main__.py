@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from .archive import Archive
+from .browser_sync import capture_connectivity, import_connectivity
 from .fleet import Fleet
 from .heartbeat import Heartbeat, UNHEALTHY_FILE
 
@@ -189,12 +190,26 @@ def check_fleet(db, root, limit, run_id):
     return completed
 
 
-def download_invoices(db, root, run_id):
+def connectivity_source():
+    mode = os.getenv("TESLA_CONNECTIVITY_SOURCE", "portal")
+    if mode not in ("portal", "browser"):
+        raise ValueError("TESLA_CONNECTIVITY_SOURCE must be portal or browser")
+    return mode
+
+
+def pdf_limit():
     limit = int(os.getenv("MAX_PDF_BYTES", "10000000"))
     if limit < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
+    return limit
+
+
+def download_invoices(db, root, run_id):
+    limit = pdf_limit()
+    browser_connectivity = connectivity_source() == "browser"
+    categories = ("supercharger",) if browser_connectivity else CATEGORIES
     sources = []
-    for category in CATEGORIES:
+    for category in categories:
         try:
             sources.append(Source.from_env(category))
         except (PortalError, ValueError) as exc:
@@ -213,7 +228,9 @@ def download_invoices(db, root, run_id):
             supercharger_complete = check_fleet(db, root, limit, run_id)
         else:
             LOG.info("Supercharger web check incomplete. Optional Fleet fallback is not configured")
-    return supercharger_complete and "connectivity" in completed
+    if browser_connectivity:
+        LOG.info("Premium Connectivity uses on-demand desktop browser sync")
+    return supercharger_complete and (browser_connectivity or "connectivity" in completed)
 
 
 class Mailer:
@@ -296,12 +313,13 @@ def archive_pdfs(db, archive):
     return success
 
 
-def send_pending(db, bucket):
+def send_pending(db, bucket, category=None):
     pending = db.execute(
         "SELECT i.digest, i.category, r.retrieved_at, r.run_id FROM invoices i "
         "JOIN archives a ON a.digest=i.digest AND a.bucket=? "
-        "JOIN retrievals r ON r.digest=i.digest WHERE i.status='pending' ORDER BY i.rowid",
-        (bucket,),
+        "JOIN retrievals r ON r.digest=i.digest WHERE i.status='pending' "
+        "AND (? IS NULL OR i.category=?) ORDER BY i.rowid",
+        (bucket, category, category),
     ).fetchall()
     if not pending:
         return True
@@ -406,10 +424,10 @@ def schedule():
     if not os.getenv("S3_BUCKET", "").strip():
         raise ValueError("S3_BUCKET is required")
     Mailer()
-    if int(os.getenv("MAX_PDF_BYTES", "10000000")) < 1:
-        raise ValueError("MAX_PDF_BYTES must be positive")
+    pdf_limit()
     root = Path(os.getenv("DATA_DIR", "/data"))
-    Source.from_env("connectivity")
+    if connectivity_source() == "portal":
+        Source.from_env("connectivity")
     LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri"), scheduled_time, zone)
     failed_day = None
     retry_at = 0
@@ -464,6 +482,9 @@ def main():
     mode.add_argument("--baseline", action="store_true")
     for name in ("schedule", "status", "login", "import-session", "health", "fleet-authorize"):
         commands.add_parser(name)
+    commands.add_parser("browser-sync-connectivity")
+    receive = commands.add_parser("import-connectivity")
+    receive.add_argument("--download-only", action="store_true")
     resolve = commands.add_parser("resolve")
     resolve.add_argument("digest")
     resolve.add_argument("status", choices=("sent", "pending"))
@@ -483,6 +504,9 @@ def main():
                     parser.error("fleet-authorize requires an interactive terminal")
                 Fleet(root).authorize()
                 return 0
+            if args.command == "browser-sync-connectivity":
+                capture_connectivity(root, pdf_limit(), save_state)
+                return 0
             if args.command == "login":
                 interactive_session(root)
                 return 0
@@ -495,6 +519,18 @@ def main():
                 save_state(root, state)
                 return 0
             with closing(database(root)) as db:
+                if args.command == "import-connectivity":
+                    import sys
+
+                    run_id = uuid4().hex
+                    import_connectivity(
+                        sys.stdin.buffer, pdf_limit(),
+                        lambda pdf: store_pdf(db, "connectivity", pdf, run_id=run_id),
+                    )
+                    archive = Archive()
+                    archived = archive_pdfs(db, archive)
+                    sent = args.download_only or send_pending(db, archive.bucket, category="connectivity")
+                    return 0 if archived and sent else 1
                 if args.command == "run":
                     if args.baseline:
                         if db.execute("SELECT 1 FROM invoices WHERE status IN ('sent', 'uncertain')").fetchone():

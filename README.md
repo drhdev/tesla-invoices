@@ -2,7 +2,7 @@
 
 A Python service that checks for Tesla Supercharger and Premium Connectivity invoices and emails new PDFs via SMTP. By default it runs on weekdays at 12:00 Europe/Berlin time. A persistent Docker volume stores the invoice database, delivery history, and Tesla browser session. Each PDF is archived in S3 before it can be emailed.
 
-[How it works](#how-it-works) · [Deploy on Coolify](#deploy-on-coolify) · [Configuration](#configuration) · [Uptime Kuma](#uptime-kuma) · [Local setup](#local-setup) · [Troubleshooting](#troubleshooting)
+[How it works](#how-it-works) · [Deploy on Coolify](#deploy-on-coolify) · [Configuration](#configuration) · [Desktop browser sync](#desktop-browser-sync) · [Uptime Kuma](#uptime-kuma) · [Local setup](#local-setup) · [Troubleshooting](#troubleshooting)
 
 ## How it works
 
@@ -32,6 +32,7 @@ Use [`.env.example`](.env.example) as the configuration reference. Set these as 
 | Settings | Purpose |
 | --- | --- |
 | `TESLA_LOGIN_URL`, `TESLA_EMAIL`, `TESLA_PASSWORD` | Web sign-in. The URL defaults to the German Tesla account page. |
+| `TESLA_CONNECTIVITY_SOURCE` | `portal` (default) for scheduled Premium Connectivity checks or `browser` for [desktop browser sync](#desktop-browser-sync). |
 | `TESLA_CONNECTIVITY_*`, `TESLA_SUPERCHARGER_*` | Invoice page URLs and selectors. See [Tesla web sources](#tesla-web-sources). |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY` | Mail server and transport. Use `starttls` with port 587 or `ssl` with port 465 as required by your provider. |
 | `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`, `MAIL_TO` | SMTP credentials and sender/recipient addresses. Use one address per field. |
@@ -123,6 +124,31 @@ ssh coolify-host.example.com 'docker exec -i worker-container python -m tesla_in
 ```
 
 Treat the session file as a credential. Export `TESLA_LOGIN_URL` on the desktop before running the login command if you use a custom URL.
+
+## Desktop browser sync
+
+Premium Connectivity can be checked on demand in a signed-in desktop browser. Choose `TESLA_CONNECTIVITY_SOURCE=browser` in Coolify to use this for Premium Connectivity while the worker continues scheduled Supercharger checks. No Tesla password is required on the server for the desktop sync. The local browser signs in directly with Tesla and keeps its session on the desktop. The importer receives only the collected PDFs over SSH.
+
+1. On a desktop with a graphical session, install the project dependencies and run `playwright install chromium` as shown in [Sign-in with MFA](#sign-in-with-mfa).
+2. From the project directory, run this block. Replace the SSH hostname and Docker container name with your deployment values.
+
+   ```sh
+   (
+     umask 077
+     bundle=$(mktemp)
+     trap 'rm -f "$bundle"' EXIT
+     DATA_DIR=./data python -m tesla_invoice browser-sync-connectivity > "$bundle" &&
+       ssh coolify-host.example.com \
+         'docker exec -i worker-container python -m tesla_invoice import-connectivity' < "$bundle"
+   )
+   ```
+
+3. In the browser that opens, sign in and open the Premium Connectivity invoice list. Press Enter in the terminal once the list is ready. The command collects the PDFs as a batch and the worker archives and emails newly queued Premium Connectivity invoices.
+
+The default selector matches direct PDF links in rows mentioning Premium Connectivity in English or German. If the site uses different markup or download buttons, export the applicable `TESLA_CONNECTIVITY_LIST`, `TESLA_CONNECTIVITY_INVOICE`, `TESLA_CONNECTIVITY_MODE`, and optional pagination settings in the desktop shell. The original scheduled portal mode also stays available. Browser sync needs Tesla to expose the invoice to the signed-in session. If your account has no accessible list or download in the browser, this route cannot retrieve it. The scheduled health check in browser mode covers the scheduled sources and queue, not the age of the last desktop sync.
+
+> [!NOTE]
+> Use a test recipient before the first import if you want to verify delivery without sending historical invoices to your production recipient. An import can queue every accessible historical PDF the first time. Later imports deduplicate identical PDFs against the worker's existing database.
 
 ## Uptime Kuma
 

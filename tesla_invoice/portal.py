@@ -152,6 +152,10 @@ def collect(page, source, login_url, limit, store, known, save_session):
         if is_login(page):
             raise LoginRequired("The Tesla invoice page still requires sign-in")
 
+    collect_visible(page, source, limit, store, known, save_session)
+
+
+def collect_visible(page, source, limit, store, known, save_session):
     listing = page.locator(source.listing).first
     invoices = page.locator(source.invoice)
     empty = page.locator(source.empty).first if source.empty else None

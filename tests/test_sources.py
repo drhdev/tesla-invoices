@@ -81,3 +81,11 @@ class SourceRoutingTest(unittest.TestCase):
         self.portal.return_value = {"connectivity"}
         self.assertFalse(self.run_check())
         self.fleet.assert_not_called()
+
+    def test_desktop_browser_mode_schedules_supercharger_only(self):
+        os.environ["TESLA_CONNECTIVITY_SOURCE"] = "browser"
+        self.portal.return_value = {"supercharger"}
+        self.assertTrue(self.run_check())
+        sources = self.portal.call_args.args[2]
+        self.assertEqual([source.name for source in sources], ["supercharger"])
+        self.fleet.assert_not_called()
