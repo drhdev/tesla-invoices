@@ -20,7 +20,7 @@ from uuid import uuid4
 from .archive import Archive
 from .fleet import Fleet
 
-from .portal import LoginRequired, Source, collect, goto, is_login, safe_error, tesla_url
+from .portal import LoginRequired, PortalError, Source, collect, goto, is_login, safe_error, tesla_url
 
 LOG = logging.getLogger("tesla_invoice")
 CATEGORIES = {"supercharger": "Supercharger", "connectivity": "Premium Connectivity"}
@@ -128,7 +128,7 @@ def check_portal(db, root, sources, limit, run_id):
     from playwright.sync_api import sync_playwright
 
     login_url = tesla_url(os.getenv("TESLA_LOGIN_URL", "https://www.tesla.com/de_DE/teslaaccount"))
-    success = True
+    completed = set()
     with sync_playwright() as playwright, closing(playwright.chromium.launch()) as browser:
         for source in sources:
             def known(invoice_id):
@@ -152,57 +152,64 @@ def check_portal(db, root, sources, limit, run_id):
 
             try:
                 retry(attempt, source.name)
+                completed.add(source.name)
                 LOG.info("%s: Portal check complete", source.name)
             except Exception as exc:
                 LOG.error("%s: Portal check failed (%s)", source.name, safe_error(exc))
-                success = False
-    return success
+    return completed
+
+
+def check_fleet(db, root, limit, run_id):
+    LOG.warning("Supercharger web check incomplete. Trying the Tesla Fleet API fallback")
+    try:
+        fleet = Fleet(root)
+    except ValueError as exc:
+        LOG.error("%s", exc)
+        return False
+
+    try:
+        def known(invoice_id):
+            return db.execute(
+                "SELECT 1 FROM portal_ids WHERE category='supercharger' AND invoice_id=?",
+                (invoice_id,),
+            ).fetchone() is not None
+
+        completed = retry(
+            lambda: fleet.collect(
+                limit, known, lambda pdf, invoice_id: store_pdf(db, "supercharger", pdf, invoice_id, run_id), retry
+            ),
+            "Tesla Fleet history",
+        )
+    except Exception as exc:
+        LOG.error("Supercharger: Tesla Fleet fallback failed (%s)", safe_error(exc))
+        return False
+    if completed:
+        LOG.info("Supercharger: Tesla Fleet fallback complete")
+    return completed
 
 
 def download_invoices(db, root, run_id):
     limit = int(os.getenv("MAX_PDF_BYTES", "10000000"))
     if limit < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
-    mode = os.getenv("TESLA_SUPERCHARGER_SOURCE", "fleet")
-    success = True
     sources = []
-    if mode == "fleet":
+    for category in CATEGORIES:
         try:
-            fleet = Fleet(root)
+            sources.append(Source.from_env(category))
+        except (PortalError, ValueError) as exc:
+            LOG.warning("%s: Web source unavailable (%s)", category, str(exc))
 
-            def known(invoice_id):
-                return db.execute(
-                    "SELECT 1 FROM portal_ids WHERE category='supercharger' AND invoice_id=?",
-                    (invoice_id,),
-                ).fetchone() is not None
-
-            success = retry(
-                lambda: fleet.collect(
-                    limit, known, lambda pdf, invoice_id: store_pdf(db, "supercharger", pdf, invoice_id, run_id), retry
-                ),
-                "Tesla Fleet history",
-            )
-            if success:
-                LOG.info("Supercharger: Tesla Fleet API check complete")
+    completed = set()
+    if sources:
+        try:
+            completed = check_portal(db, root, sources, limit, run_id)
         except Exception as exc:
-            LOG.error("Supercharger: Tesla Fleet API check failed (%s)", safe_error(exc))
-            success = False
-    elif mode == "portal":
-        sources.append("supercharger")
-    else:
-        LOG.error("TESLA_SUPERCHARGER_SOURCE must be fleet or portal")
-        success = False
-    sources.append("connectivity")
-    configured = []
-    for category in sources:
-        try:
-            configured.append(Source.from_env(category))
-        except (ValueError, KeyError) as exc:
-            LOG.error("%s: %s", category, str(exc))
-            success = False
-    if configured:
-        return check_portal(db, root, configured, limit, run_id) and success
-    return success
+            LOG.error("Tesla web check could not complete (%s)", safe_error(exc))
+
+    supercharger_complete = "supercharger" in completed
+    if not supercharger_complete:
+        supercharger_complete = check_fleet(db, root, limit, run_id)
+    return supercharger_complete and "connectivity" in completed
 
 
 class Mailer:
@@ -398,13 +405,6 @@ def schedule():
     if int(os.getenv("MAX_PDF_BYTES", "10000000")) < 1:
         raise ValueError("MAX_PDF_BYTES must be positive")
     root = Path(os.getenv("DATA_DIR", "/data"))
-    mode = os.getenv("TESLA_SUPERCHARGER_SOURCE", "fleet")
-    if mode == "fleet":
-        Fleet(root)
-    elif mode == "portal":
-        Source.from_env("supercharger")
-    else:
-        raise ValueError("TESLA_SUPERCHARGER_SOURCE must be fleet or portal")
     Source.from_env("connectivity")
     LOG.info("Schedule active (%s, %s, %s)", os.getenv("RUN_DAYS", "mon,tue,wed,thu,fri"), scheduled_time, zone)
     while True:
